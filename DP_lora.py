@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from opacus import PrivacyEngine, GradSampleModule
 from torchvision import datasets, transforms
+from torchvision import models
 from filelock import FileLock
 import numpy as np
 from torch.utils.data import SubsetRandomSampler, random_split, DataLoader
@@ -97,6 +98,7 @@ parser.add_argument("--lora", type=int, default=1, help="the perturbation radio 
 parser.add_argument('--freeze', default=0, type=int, help='# batch_size')
 parser.add_argument('--K', default=20, type=int, help='#workers')
 parser.add_argument("--ls_sigma2", type=float, default=0.01)
+parser.add_argument("--la_filter", type=int, default=1, help="1: apply LA-LoRA Gaussian low-pass filter to noisy LoRA gradients; 0: disable")
 
 args = parser.parse_args()
 gpu_idx = args.gpu
@@ -767,6 +769,61 @@ def get_dp_params(privacy_engine):
 
 
 
+def is_lora_A_param(name):
+    return "lora_A" in name
+
+
+def is_lora_B_param(name):
+    return "lora_B" in name
+
+
+def is_classifier_param(name):
+    return ("classifier" in name) or ("head" in name)
+
+
+def gaussian_lowpass_1d_along_dim(x, dim):
+    """
+    LA-LoRA 论文中的固定 5-tap Gaussian low-pass filter: [1, 4, 6, 4, 1] / 16。
+    对 LoRA A/B 的梯度做确定性后处理，不改变 DP 机制本身。
+    """
+    if x is None or x.dim() < 2:
+        return x
+    dim = dim if dim >= 0 else x.dim() + dim
+    if dim < 0 or dim >= x.dim():
+        return x
+
+    orig_dtype = x.dtype
+    y = x.float().transpose(dim, -1).contiguous()
+    orig_shape = y.shape
+    length = orig_shape[-1]
+    if length <= 1:
+        return x
+
+    y = y.reshape(-1, 1, length)
+    kernel = torch.tensor([1., 4., 6., 4., 1.], dtype=y.dtype, device=y.device).view(1, 1, 5) / 16.0
+    # reflect padding 对长度太短的张量不稳定，这里统一用 replicate，更稳妥且改动最小。
+    y = F.pad(y, (2, 2), mode="replicate")
+    y = F.conv1d(y, kernel)
+    y = y.reshape(orig_shape).transpose(dim, -1).contiguous()
+    return y.to(orig_dtype)
+
+
+def gaussian_lowpass_lora_grad(grad, name):
+    """
+    A ∈ R^{r×n}: row-wise along input feature dimension -> dim=1
+    B ∈ R^{m×r}: column-wise along output dimension -> dim=0
+    """
+    if grad is None:
+        return grad
+    if is_lora_A_param(name):
+        return gaussian_lowpass_1d_along_dim(grad, dim=1)
+    if is_lora_B_param(name):
+        return gaussian_lowpass_1d_along_dim(grad, dim=0)
+    return grad
+
+
+
+
 @ray.remote(num_gpus=num_gpus_per)
 class DataWorker(object):
 
@@ -1008,83 +1065,118 @@ class DataWorker(object):
 
 
     def update_FedAvg_AL(self, weights, E, index, lr):
+        """
+        LA-LoRA: Local Alternating LoRA.
+        尽量少改原训练结构，只修正 LA-LoRA 的两个关键点：
+        1) 在每个本地 step 内交替更新 LoRA_B / LoRA_A，而不是按 batch_idx 交替；
+        2) DP clip + noise 后，对 LoRA 梯度施加论文中的固定 5-tap Gaussian low-pass filter，
+           然后只调用一次 optimizer.step()，避免“手动 param.data.add_ + optimizer.step()”双重更新。
+        """
         self.model.load_state_dict(weights)
         self.model.to(device)
         self.data_id_loader(index)
-        if args.freeze==0:
-            for name, param in self.model.named_parameters():
-                if "classifier" in name or "head" in name:
-                    param.requires_grad = True
-        self.optimizer = torch.optim.SGD([
-                {"params": [p for n, p in self.model.named_parameters() if "lora_A" in n], "lr": lr,"weight_decay":  0.001},
-                {"params": [p for n, p in self.model.named_parameters() if "lora_B" in n], "lr": lr * 2,"weight_decay":  0.001},
-                {"params": [p for n, p in self.model.named_parameters() if "lora_" not in n], "lr": lr,"weight_decay": 0.001}
-            ])
+
+        # 论文设定：冻结 backbone W0，仅训练 LoRA A/B；视觉任务中可同时训练分类头。
+        for name, param in self.model.named_parameters():
+            if is_lora_A_param(name) or is_lora_B_param(name):
+                param.requires_grad = True
+            elif is_classifier_param(name) and args.freeze == 0:
+                param.requires_grad = True
+            elif args.lora == 1:
+                param.requires_grad = False
+
+        lora_A_params = [p for n, p in self.model.named_parameters() if is_lora_A_param(n)]
+        lora_B_params = [p for n, p in self.model.named_parameters() if is_lora_B_param(n)]
+        head_params = [p for n, p in self.model.named_parameters() if is_classifier_param(n) and args.freeze == 0]
+
+        param_groups = [
+            {"params": lora_A_params, "lr": lr, "weight_decay": 0.01},
+            {"params": lora_B_params, "lr": lr, "weight_decay": 0.01},
+        ]
+        if len(head_params) > 0:
+            param_groups.append({"params": head_params, "lr": lr, "weight_decay": 0.01})
+
+        self.optimizer = torch.optim.SGD(param_groups, lr=lr, weight_decay=1e-3)
         if args.optimizer == 'AdamW':
-            self.optimizer = torch.optim.AdamW([
-                {"params": [p for n, p in self.model.named_parameters() if "lora_A" in n], "lr": lr},
-                {"params": [p for n, p in self.model.named_parameters() if "lora_B" in n], "lr": lr * 2},
-                {"params": [p for n, p in self.model.named_parameters() if "lora_" not in n], "lr": lr}
-            ], weight_decay=0.01)
+            adamw_groups = [
+                {"params": lora_A_params, "lr": lr},
+                {"params": lora_B_params, "lr": lr},
+            ]
+            if len(head_params) > 0:
+                adamw_groups.append({"params": head_params, "lr": lr})
+            self.optimizer = torch.optim.AdamW(adamw_groups, weight_decay=0.01)
+
         self.privacy = args.privacy
         self.dp_sigma = args.dp_sigma
-        self.laplacian = args.laplacian
-        self.ls_sigma = args.ls_sigma
-        step = 0  # 新增步数计数
+        step = 0
+        loss = torch.tensor(0.0, device=device)
+
         for e in range(E):
             for batch_idx, (data, target) in enumerate(self.data_iterator):
                 if step >= args.K:
                     break
+
+                # 论文默认 1-step B / 1-step A：本地第 1,3,5... 步更新 B；第 2,4,6... 步更新 A。
+                # Python 中 step=0 对应论文 k=1，所以 update_B = True。
+                update_B = (step % 2 == 0)
                 for name, param in self.model.named_parameters():
-                    if batch_idx%2==1:
-                        if "lora_A" in name:
-                            param.requires_grad = False
-                        if "lora_B" in name:
-                            param.requires_grad = True
-                    if batch_idx%2==0:
-                        if "lora_A" in name:
-                            param.requires_grad = True
-                        if "lora_B" in name:
-                            param.requires_grad = False
+                    if is_lora_A_param(name):
+                        param.requires_grad = not update_B
+                    elif is_lora_B_param(name):
+                        param.requires_grad = update_B
+                    elif is_classifier_param(name) and args.freeze == 0:
+                        # 分类头保持可训练，便于视觉分类任务适配；若想完全只训 LoRA，可传 --freeze 1。
+                        param.requires_grad = True
+                    elif args.lora == 1:
+                        param.requires_grad = False
+
                 data = data.to(device)
                 target = target.to(device)
-                self.model.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 output = self.model(data)
-                loss = self.criterion(output, target)
+                loss = self.criterion(output, target.long())
                 loss.backward()
-                if args.privacy == 1:
-                    layer_clip_norms = {}
-                    for name, param in self.model.named_parameters():
-                        if param.grad is None:
-                            continue
-                        norm_value = torch.norm(param.grad, 2)
-                        layer_clip_norms[name] = norm_value
-                    values = list(layer_clip_norms.values())
-                    median_value = statistics.median(values)
-                    args.C = min(median_value, 0.4)
-                    for name, param in self.model.named_parameters():
-                        if param.grad is None:
-                            continue
-                        norm_value = torch.norm(param.grad, 2)
-                        param.grad *= min(1, args.C / norm_value)
-                        noise = torch.normal(0, args.dp_sigma * args.C / args.batch_size,
-                                             size=param.grad.shape)
-                        noise = noise.to(device)
-                        param.grad += noise
 
-                if args.ls_sigma != 0:
+                if args.privacy == 1:
+                    layer_clip_norms = []
                     for name, param in self.model.named_parameters():
-                        if param.grad is not None:
-                            if 'lora' in name:
-                                param.data.add_(other=LaplacianSmoothing2D(param.grad.data, args.ls_sigma, device),
-                                                alpha=-lr)
-                            else:
-                                param.data.add_(other=LaplacianSmoothing(param.grad.data, args.ls_sigma, device),
-                                                alpha=-lr)
+                        if param.grad is None:
+                            continue
+                        layer_clip_norms.append(torch.norm(param.grad.detach(), 2).item())
+
+                    if len(layer_clip_norms) > 0:
+                        median_value = statistics.median(layer_clip_norms)
+                        args.C = min(float(median_value), 0.4)
+
+                    for name, param in self.model.named_parameters():
+                        if param.grad is None:
+                            continue
+                        norm_value = torch.norm(param.grad.detach(), 2)
+                        clip_coef = min(1.0, float(args.C / (norm_value.item() + 1e-12)))
+                        param.grad.mul_(clip_coef)
+                        noise = torch.normal(
+                            mean=0.0,
+                            std=args.dp_sigma * args.C / args.batch_size,
+                            size=param.grad.shape,
+                            device=param.grad.device,
+                            dtype=param.grad.dtype,
+                        )
+                        param.grad.add_(noise)
+
+                # LA-LoRA filter：只对 LoRA A/B 的“已加噪梯度”做固定 Gaussian 低通滤波。
+                # 这是 DP 后处理，不改变隐私机制；--la_filter 0 可关闭，用于 LA-LoRA(-filter) 消融。
+                if args.la_filter == 1:
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None and (is_lora_A_param(name) or is_lora_B_param(name)):
+                            param.grad.data = gaussian_lowpass_lora_grad(param.grad.data, name)
 
                 self.optimizer.step()
-                self.optimizer.zero_grad()
                 step += 1
+
+            if step >= args.K:
+                break
+
+        self.loss = loss.item() if torch.is_tensor(loss) else float(loss)
         delta_w = {k: v.cpu() for k, v in self.model.state_dict().items()}
         for k, v in self.model.state_dict().items():
             delta_w[k] = v.cpu() - weights[k]
@@ -1418,6 +1510,10 @@ if __name__ == "__main__":
     }
     #  配置logger
     import logging
+    os.makedirs("./log", exist_ok=True)
+    os.makedirs("./plot", exist_ok=True)
+    os.makedirs("./model", exist_ok=True)
+    os.makedirs("./checkpoint", exist_ok=True)
 
     logger = logging.getLogger(__name__)
     logger.setLevel(level=logging.INFO)
@@ -1644,9 +1740,9 @@ if __name__ == "__main__":
     # for early stop
     best_acc = 0
     no_improve = 0
-    zero = model.get_weights()
+    zero = {k: v.clone() for k, v in model.state_dict().items()}
     # print(delta_g_sum)
-    for k, v in model.get_weights().items():
+    for k, v in model.state_dict().items():
         zero[k] = zero[k] - zero[k]
     ps_c = deepcopy(zero)
 
