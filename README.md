@@ -1,6 +1,8 @@
 
 
 # LA-LORA
+# Rethinking LoRA for Privacy-Preserving Federated Learning in Large Models
+恭喜《Rethinking LoRA for Privacy-Preserving Federated Learning in Large Models》被 ICLR 2026 接收！这个方向把 LoRA、大模型联邦学习和隐私保护结合起来，选题很有价值，也很符合当前大模型高效微调与隐私计算的发展趋势。
 
 * 有代码问题+vx15653218567 马上回复！帮忙引用论文一下就行！
 
